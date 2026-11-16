@@ -1288,6 +1288,219 @@ describe('middleware test', () => {
 		)
 	})
 
+	describe('legacy callback store error propagation', () => {
+		// A store using the deprecated callback-based `incr` API that reports a
+		// storage failure through the callback's first argument. The error must
+		// survive `promisifyStore` and reach the middleware's error handling with
+		// its identity intact - see the `if (error) reject(error)` branch in
+		// source/rate-limit.ts.
+		class LegacyStoreCallbackErrors implements LegacyStore {
+			readonly error: Error
+
+			constructor(error: Error) {
+				this.error = error
+			}
+
+			incr(_key: string, callback: IncrementCallback): void {
+				callback(this.error, 0, undefined)
+			}
+
+			decrement(_key: string): void {}
+
+			resetKey(_key: string): void {}
+		}
+
+		// The modern, promise-based equivalent, used as a control to make sure the
+		// two storage shapes behave identically once the legacy one is promisified.
+		class ModernStoreRejectingErrors implements Store {
+			readonly error: Error
+
+			constructor(error: Error) {
+				this.error = error
+			}
+
+			init(_options: Options): void {}
+
+			async increment(_key: string): Promise<ClientRateLimitInfo> {
+				throw this.error
+			}
+
+			async decrement(_key: string): Promise<void> {}
+
+			async resetKey(_key: string): Promise<void> {}
+
+			async resetAll(): Promise<void> {}
+		}
+
+		// A store exposing both interfaces at once. Per the `isLegacyStore` guard,
+		// it must be treated as a modern store: the `increment` rejection is what
+		// the middleware should observe, and `incr` must never be invoked.
+		class CompatStoreBothInterfaces implements Store, LegacyStore {
+			readonly error: Error
+			incr = jest.fn()
+
+			constructor(error: Error) {
+				this.error = error
+			}
+
+			init(_options: Options): void {}
+
+			async increment(_key: string): Promise<ClientRateLimitInfo> {
+				throw this.error
+			}
+
+			async decrement(_key: string): Promise<void> {}
+
+			async resetKey(_key: string): Promise<void> {}
+
+			async resetAll(): Promise<void> {}
+		}
+
+		it.each([
+			['legacy callback', LegacyStoreCallbackErrors],
+			['modern promise', ModernStoreRejectingErrors],
+		])('should reject the request by default when the %s store reports an error', async (name, StoreClass) => {
+			const storeError = new Error(`${name} store failure`)
+			let errorPassedToHandler: Error | undefined
+
+			const app = createServer(
+				rateLimit({
+					limit: 1,
+					store: new StoreClass(storeError),
+				}),
+			)
+			app.use(
+				(
+					error: Error,
+					_request: Request,
+					response: Response,
+					_next: NextFunction,
+				) => {
+					errorPassedToHandler = error
+					response.status(500).send(error.message)
+				},
+			)
+
+			await request(app).get('/').expect(500, storeError.message)
+
+			// Assert the error's identity, not just its message, so a refactor that
+			// wraps, replaces or swallows the original rejection fails this test.
+			expect(errorPassedToHandler).toStrictEqual(storeError)
+		})
+
+		it.each([
+			['legacy callback', LegacyStoreCallbackErrors],
+			['modern promise', ModernStoreRejectingErrors],
+		])('should allow the request and log the original error when passOnStoreError is true (%s store)', async (name, StoreClass) => {
+			jest.spyOn(console, 'error').mockImplementation(() => {})
+			const storeError = new Error(`${name} store failure`)
+
+			const app = createServer(
+				rateLimit({
+					limit: 1,
+					store: new StoreClass(storeError),
+					passOnStoreError: true,
+				}),
+			)
+
+			await request(app).get('/').expect(200, 'Hi there!')
+			expect(console.error).toHaveBeenCalledTimes(1)
+			// ConsoleLogger reverses its arguments before calling console.error,
+			// so the message is received first and the error second.
+			expect(console.error).toHaveBeenCalledWith(
+				expect.stringContaining('allowing request without rate-limiting'),
+				storeError,
+			)
+		})
+
+		it('should propagate the exact callback error object from a legacy store to next()', async () => {
+			const storeError = new Error('legacy callback error identity')
+			const limiter = rateLimit({
+				limit: 1,
+				store: new LegacyStoreCallbackErrors(storeError),
+				validate: false,
+			})
+			const next = jest.fn()
+
+			await limiter({} as Request, {} as Response, next as NextFunction)
+
+			expect(next).toHaveBeenCalledTimes(1)
+			expect(next).toHaveBeenCalledWith(storeError)
+		})
+
+		it('should log the exact callback error object when a legacy store fails and passOnStoreError is true', async () => {
+			jest.spyOn(console, 'error').mockImplementation(() => {})
+			const storeError = new Error('legacy callback error identity')
+			const limiter = rateLimit({
+				limit: 1,
+				store: new LegacyStoreCallbackErrors(storeError),
+				passOnStoreError: true,
+				validate: false,
+			})
+			const next = jest.fn()
+
+			await limiter({} as Request, {} as Response, next as NextFunction)
+
+			expect(next).toHaveBeenCalledTimes(1)
+			expect(next).toHaveBeenCalledWith()
+			expect(console.error).toHaveBeenCalledTimes(1)
+			expect(console.error).toHaveBeenCalledWith(
+				'express-rate-limit: error from store, allowing request without rate-limiting.',
+				storeError,
+			)
+		})
+
+		it('should route a dual-interface compat store through the modern `increment` path, never `incr`', async () => {
+			const storeError = new Error('compat store failure')
+			const store = new CompatStoreBothInterfaces(storeError)
+			let errorPassedToHandler: Error | undefined
+
+			const app = createServer(
+				rateLimit({
+					limit: 1,
+					store,
+				}),
+			)
+			app.use(
+				(
+					error: Error,
+					_request: Request,
+					response: Response,
+					_next: NextFunction,
+				) => {
+					errorPassedToHandler = error
+					response.status(500).send(error.message)
+				},
+			)
+
+			await request(app).get('/').expect(500, storeError.message)
+			expect(store.incr).not.toHaveBeenCalled()
+			expect(errorPassedToHandler).toStrictEqual(storeError)
+		})
+
+		it('should allow the request via the modern path when a dual-interface compat store fails and passOnStoreError is true', async () => {
+			jest.spyOn(console, 'error').mockImplementation(() => {})
+			const storeError = new Error('compat store failure')
+			const store = new CompatStoreBothInterfaces(storeError)
+
+			const app = createServer(
+				rateLimit({
+					limit: 1,
+					store,
+					passOnStoreError: true,
+				}),
+			)
+
+			await request(app).get('/').expect(200, 'Hi there!')
+			expect(store.incr).not.toHaveBeenCalled()
+			expect(console.error).toHaveBeenCalledTimes(1)
+			expect(console.error).toHaveBeenCalledWith(
+				expect.stringContaining('allowing request without rate-limiting'),
+				storeError,
+			)
+		})
+	})
+
 	describe('with the logger set', () => {
 		let logger: Logger
 
